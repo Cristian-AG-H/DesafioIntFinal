@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import Layout from '../../components/Layout.jsx'
 import { 
   biseccionDetallada, newtonRaphsonDetallado, secanteDetallada,
@@ -10,40 +11,82 @@ import { Line } from 'react-chartjs-2'
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js'
 import './Deterioro.css'
 import { supabase } from '../../lib/supabase.js'
+import { sanitizeJson } from '../../lib/utils.js'
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend)
 
 export default function Deterioro() {
+  const [searchParams] = useSearchParams()
+  const simulacionIdUrl = searchParams.get('simulacion')
+  const escenarioUrl = searchParams.get('escenario')
+
   const [escenarios, setEscenarios] = useState([])
   const [tipoSel, setTipoSel] = useState('NORMAL')
   const [params, setParams] = useState({ D0: 0, alpha: 0.5, beta: 0.02, umbral: 5.0 })
   
-  const [activeTab, setActiveTab] = useState('raices') // 'raices', 'sistemas'
+  const [activeTab, setActiveTab] = useState('raices')
   const [resultadoRaices, setResultadoRaices] = useState(null)
   const [resultadoSistemas, setResultadoSistemas] = useState(null)
   const [graficoConvergencia, setGraficoConvergencia] = useState(null)
   
   const [guardado, setGuardado] = useState(false)
   const [error, setError] = useState(null)
+  const [loadingSave, setLoadingSave] = useState(false)
 
-  // Matriz SPD Fija para el sistema lineal de calibración (Semana 1)
   const A_sys = [
     [10, 2, 1, 0],
     [2, 12, -2, 1],
     [1, -2, 15, 3],
     [0, 1, 3, 14]
   ]
-  const b_sys = [13, 31, -9, 41] // Resultado exacto esperado: [1, 2, -1, 3]
+  const b_sys = [13, 31, -9, 41]
 
   useEffect(() => {
     supabase.from('escenario').select('*').eq('caso_id', 2).order('tipo').then(({ data }) => {
       if (data) {
         setEscenarios(data)
-        const normal = data.find(e => e.tipo === 'NORMAL')
-        if (normal) setParams(normal.parametros_json)
+        if (!simulacionIdUrl) {
+          const normal = data.find(e => e.tipo === 'NORMAL')
+          if (normal) setParams(normal.parametros_json)
+        }
       }
     })
-  }, [])
+  }, [simulacionIdUrl])
+
+  // Cargar desde Historial
+  useEffect(() => {
+    if (!simulacionIdUrl || escenarios.length === 0) return
+
+    const cargarDesdeHistorial = async () => {
+      try {
+        const { data, error: errDb } = await supabase
+          .from('simulacion')
+          .select('escenario(parametros_json)')
+          .eq('id', simulacionIdUrl)
+          .single()
+
+        if (errDb) throw errDb
+
+        if (data?.escenario?.parametros_json) {
+          const paramsGuardados = data.escenario.parametros_json
+          setParams(paramsGuardados)
+          if (escenarioUrl) setTipoSel(escenarioUrl)
+          calcular(paramsGuardados)
+        }
+      } catch (err) {
+        console.error("Error al cargar simulación del historial:", err)
+        setError("No se pudieron recuperar los datos del historial.")
+      }
+    }
+    cargarDesdeHistorial()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [simulacionIdUrl, escenarios])
+
+  const limpiarUrl = () => {
+    if (simulacionIdUrl || escenarioUrl) {
+      window.history.replaceState({}, '', '/modulo/2')
+    }
+  }
 
   const cambiarEscenario = (tipo) => {
     setTipoSel(tipo)
@@ -53,17 +96,22 @@ export default function Deterioro() {
     setResultadoSistemas(null)
     setGraficoConvergencia(null)
     setGuardado(false)
+    limpiarUrl()
   }
 
-  const handleInputChange = (e) => setParams({ ...params, [e.target.name]: parseFloat(e.target.value) || 0 })
+  const handleInputChange = (e) => {
+    setParams({ ...params, [e.target.name]: parseFloat(e.target.value) || 0 })
+    setGuardado(false)
+    limpiarUrl()
+  }
 
-  const calcular = () => {
+  const calcular = (paramsParaCalcular = params) => {
     setError(null)
     setGuardado(false)
     try {
-      // 1. CÁLCULO DE RAÍCES: f(t) = D0 + alpha*t + beta*t^2 - umbral
-      const f = (t) => params.D0 + params.alpha * t + params.beta * t * t - params.umbral
-      const df = (t) => params.alpha + 2 * params.beta * t
+      // 1. RAÍCES
+      const f = (t) => paramsParaCalcular.D0 + paramsParaCalcular.alpha * t + paramsParaCalcular.beta * t * t - paramsParaCalcular.umbral
+      const df = (t) => paramsParaCalcular.alpha + 2 * paramsParaCalcular.beta * t
 
       const rBis = biseccionDetallada(f, 0, 100, 1e-5)
       const rNew = newtonRaphsonDetallado(f, df, 10, 1e-5)
@@ -73,7 +121,6 @@ export default function Deterioro() {
         bis: rBis, new: rNew, sec: rSec
       })
 
-      // Gráfico de convergencia de error
       setGraficoConvergencia({
         labels: Array.from({ length: Math.max(rBis.historial.length, rNew.historial.length) }).map((_, i) => `Iter ${i+1}`),
         datasets: [
@@ -94,8 +141,8 @@ export default function Deterioro() {
         ]
       })
 
-      // 2. CÁLCULO DE SISTEMAS LINEALES (A_sys * x = b_sys)
-      const x0 = [0, 0, 0, 0] // Semilla inicial
+      // 2. SISTEMAS LINEALES
+      const x0 = [0, 0, 0, 0]
       const sJacobi = jacobi(A_sys, b_sys, x0, 1e-5, 100)
       const sGS = gaussSeidel(A_sys, b_sys, x0, 1e-5, 100)
       const sCG = gradienteConjugado(A_sys, b_sys, x0, 1e-5, 100)
@@ -111,13 +158,45 @@ export default function Deterioro() {
   }
 
   const guardar = async () => {
+    if (!resultadoRaices) return
+    setLoadingSave(true)
+    setError(null)
+
     try {
       const escActual = escenarios.find(e => e.tipo === tipoSel)
-      const { data: sim } = await supabase.from('simulacion').insert([{ escenario_id: escActual.id }]).select().single()
-      const { data: ejec } = await supabase.from('ejecucion_metodo').insert([{ simulacion_id: sim.id, metodo: 'Bisección, Newton, Secante, Jacobi, GS, CG, LU' }]).select().single()
-      await supabase.from('resultado_resumen').insert([{ ejecucion_id: ejec.id, valor_json: { raices: resultadoRaices, sistemas: resultadoSistemas } }])
+      if (!escActual) throw new Error("Escenario no encontrado en la base de datos.")
+
+      const { data: sim, error: errSim } = await supabase
+        .from('simulacion').insert([{ escenario_id: escActual.id, estado: 'EXITOSA' }]).select('id').single()
+      if (errSim) throw new Error(`Simulación: ${errSim.message}`)
+
+      const { data: ejec, error: errEjec } = await supabase
+        .from('ejecucion_metodo').insert([{ 
+          simulacion_id: sim.id, 
+          metodo: 'Bisección, Newton, Secante, Jacobi, GS, CG, LU',
+          convergio: true
+        }]).select('id').single()
+      if (errEjec) throw new Error(`Ejecución: ${errEjec.message}`)
+
+      // UNIMOS LOS DOS RESULTADOS Y LIMPIAMOS EL JSON
+      const valorLimpio = sanitizeJson({ raices: resultadoRaices, sistemas: resultadoSistemas })
+      
+      const { error: errRes } = await supabase
+        .from('resultado_resumen').insert([{ 
+          ejecucion_id: ejec.id, 
+          valor_json: valorLimpio,
+          referencia: 'Cálculo en vivo'
+        }])
+      if (errRes) throw new Error(`Resultado: ${errRes.message}`)
+
       setGuardado(true)
-    } catch (e) { alert(e.message) }
+    } catch (e) { 
+      console.error(e)
+      setError(`Error al guardar: ${e.message}`)
+      alert(`Error al guardar: ${e.message}`)
+    } finally {
+      setLoadingSave(false)
+    }
   }
 
   const tabStyle = (tabName) => ({
@@ -162,10 +241,10 @@ export default function Deterioro() {
           <div className="form-group"><label>Umbral Crítico (D_umbral):</label><input type="number" name="umbral" value={params.umbral} onChange={handleInputChange} /></div>
           
           <div className="button-group">
-            <button onClick={calcular} className="btn-primary">Calcular Modelos</button>
+            <button onClick={() => calcular()} className="btn-primary">Calcular Modelos</button>
             {resultadoRaices && (
-              <button onClick={guardar} className="btn-secondary">
-                {guardado ? '✅ Guardado' : 'Guardar en Historial'}
+              <button onClick={guardar} disabled={loadingSave} className="btn-secondary">
+                {loadingSave ? 'Guardando...' : guardado ? '✅ Guardado' : 'Guardar en Historial'}
               </button>
             )}
           </div>
@@ -179,7 +258,6 @@ export default function Deterioro() {
                 <div style={tabStyle('sistemas')} onClick={() => setActiveTab('sistemas')}>2. Sistemas Lineales (SPD)</div>
               </div>
 
-              {/* CONTENIDO: RAÍCES */}
               {activeTab === 'raices' && (
                 <div className="animate-fade-in">
                   <div className="chart-container">
@@ -210,7 +288,6 @@ export default function Deterioro() {
                 </div>
               )}
 
-              {/* CONTENIDO: SISTEMAS */}
               {activeTab === 'sistemas' && (
                 <div className="animate-fade-in">
                   <div style={{ color: '#d1d5db', fontSize: '0.9rem', display: 'flex', alignItems: 'center', gap: '5px', flexWrap: 'wrap' }}>
@@ -255,7 +332,6 @@ export default function Deterioro() {
                 </div>
               )}
 
-              {/* DOBLE CONCLUSIÓN */}
               <div style={{ display: 'flex', gap: '20px', marginTop: '20px' }}>
                 <div className="conclusion-box" style={{ flex: 1 }}>
                   <h3>Conclusión Numérica</h3>

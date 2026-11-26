@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import Layout from '../../components/Layout.jsx'
 import { rk4Sistema, trapecio, simpson13, romberg } from '../../math/metodos.js'
 import { MathComponent } from 'mathjax-2025'
@@ -7,10 +8,16 @@ import { Line, Bar } from 'react-chartjs-2'
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, BarElement, Title, Tooltip, Legend } from 'chart.js'
 import './Oscilaciones.css'
 import { supabase } from '../../lib/supabase.js'
+// IMPORTAMOS LA FUNCIÓN SANEADORA (Asegúrate de haberla creado en lib/utils.js)
+import { sanitizeJson } from '../../lib/utils.js' 
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, BarElement, Title, Tooltip, Legend)
 
 export default function Oscilaciones() {
+  const [searchParams] = useSearchParams()
+  const simulacionIdUrl = searchParams.get('simulacion')
+  const escenarioUrl = searchParams.get('escenario')
+
   const [escenarios, setEscenarios] = useState([])
   const [tipoSel, setTipoSel] = useState('NORMAL')
   const [params, setParams] = useState({ m: 1.0, c: 0.2, k: 4.0, F0: 0.0, T: 20, h: 0.1 })
@@ -22,34 +29,88 @@ export default function Oscilaciones() {
   
   const [guardado, setGuardado] = useState(false)
   const [error, setError] = useState(null)
+  const [loadingSave, setLoadingSave] = useState(false)
 
+  // 1. EFECTO INICIAL: Cargar escenarios base
   useEffect(() => {
     supabase.from('escenario').select('*').eq('caso_id', 3).order('tipo').then(({ data }) => {
       if (data) {
         setEscenarios(data)
-        const normal = data.find(e => e.tipo === 'NORMAL')
-        if (normal) setParams(normal.parametros_json)
+        // Solo cargamos el escenario NORMAL por defecto si NO venimos del historial
+        if (!simulacionIdUrl) {
+          const normal = data.find(e => e.tipo === 'NORMAL')
+          if (normal) setParams(normal.parametros_json)
+        }
       }
     })
-  }, [])
+  }, [simulacionIdUrl])
+
+  // 2. EFECTO PARA CARGAR DESDE EL HISTORIAL
+  useEffect(() => {
+    if (!simulacionIdUrl || escenarios.length === 0) return
+
+    const cargarDesdeHistorial = async () => {
+      try {
+        // Buscamos la simulación para obtener los parámetros del escenario asociado
+        const { data, error: errDb } = await supabase
+          .from('simulacion')
+          .select('escenario(parametros_json)')
+          .eq('id', simulacionIdUrl)
+          .single()
+
+        if (errDb) throw errDb
+
+        if (data?.escenario?.parametros_json) {
+          const paramsGuardados = data.escenario.parametros_json
+          
+          // Actualizamos los estados
+          setParams(paramsGuardados)
+          if (escenarioUrl) setTipoSel(escenarioUrl)
+
+          // Disparamos el cálculo automáticamente pasándole los parámetros recuperados
+          calcular(paramsGuardados)
+        }
+      } catch (err) {
+        console.error("Error al cargar simulación del historial:", err)
+        setError("No se pudieron recuperar los datos del historial.")
+      }
+    }
+
+    cargarDesdeHistorial()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [simulacionIdUrl, escenarios])
+
+  // Función para limpiar la URL si el usuario empieza a editar
+  const limpiarUrl = () => {
+    if (simulacionIdUrl || escenarioUrl) {
+      window.history.replaceState({}, '', '/modulo/3')
+    }
+  }
 
   const cambiarEscenario = (tipo) => {
     setTipoSel(tipo)
     const esc = escenarios.find(e => e.tipo === tipo)
     if (esc) setParams(esc.parametros_json)
+    
     setResultado(null)
     setGraficoEdo(null)
     setGraficoIntegracion(null)
     setGuardado(false)
+    limpiarUrl()
   }
 
-  const handleInputChange = (e) => setParams({ ...params, [e.target.name]: parseFloat(e.target.value) || 0 })
+  const handleInputChange = (e) => {
+    setParams({ ...params, [e.target.name]: parseFloat(e.target.value) || 0 })
+    setGuardado(false)
+    limpiarUrl()
+  }
 
-  const calcular = () => {
+  // Acepta parámetros opcionales para evitar problemas de asincronía con el estado
+  const calcular = (paramsParaCalcular = params) => {
     setError(null)
     setGuardado(false)
     try {
-      const { m, c, k, F0, T, h } = params
+      const { m, c, k, F0, T, h } = paramsParaCalcular
 
       // 1. EDO Sistema: x' = v, v' = (-c*v - k*x + F)/m
       const f_sistema = (t, y) => {
@@ -58,10 +119,9 @@ export default function Oscilaciones() {
         return [v, (-c * v - k * x + F) / m]
       }
 
-      // RK4 (importado)
       const resRK4 = rk4Sistema(f_sistema, 0, [1.0, 0.0], T, h)
 
-      // RK2 (Heun para sistemas, implementado localmente)
+      // RK2 (Heun para sistemas)
       let t = 0, y = [1.0, 0.0]
       const resRK2 = [{ t, x: y[0], v: y[1] }]
       while (t < T) {
@@ -76,7 +136,6 @@ export default function Oscilaciones() {
 
       // 2. Integración de x(t)^2
       const f_integral = (t) => {
-        // Interpolamos el valor de x(t) usando el resultado de RK4
         const index = Math.min(Math.floor(t / h), resRK4.length - 1)
         return Math.pow(resRK4[index].x, 2)
       }
@@ -113,13 +172,53 @@ export default function Oscilaciones() {
   }
 
   const guardar = async () => {
+    if (!resultado) return
+    setLoadingSave(true)
+    setError(null)
+    
     try {
       const escActual = escenarios.find(e => e.tipo === tipoSel)
-      const { data: sim } = await supabase.from('simulacion').insert([{ escenario_id: escActual.id }]).select().single()
-      const { data: ejec } = await supabase.from('ejecucion_metodo').insert([{ simulacion_id: sim.id, metodo: 'RK2, RK4, Trapecio, Simpson, Romberg' }]).select().single()
-      await supabase.from('resultado_resumen').insert([{ ejecucion_id: ejec.id, valor_json: resultado }])
+      if (!escActual) throw new Error("Escenario no encontrado en la base de datos.")
+
+      // 1. Simulación
+      const { data: sim, error: errSim } = await supabase
+        .from('simulacion')
+        .insert([{ escenario_id: escActual.id, estado: 'EXITOSA' }])
+        .select('id')
+        .single()
+      if (errSim) throw new Error(`Simulación: ${errSim.message}`)
+
+      // 2. Ejecución de método
+      const { data: ejec, error: errEjec } = await supabase
+        .from('ejecucion_metodo')
+        .insert([{ 
+          simulacion_id: sim.id, 
+          metodo: 'RK2, RK4, Trapecio, Simpson, Romberg',
+          convergio: true
+        }])
+        .select('id')
+        .single()
+      if (errEjec) throw new Error(`Ejecución: ${errEjec.message}`)
+
+      // 3. Resultado Resumen (LIMPIANDO EL JSON DE NaN E INFINITY)
+      const valorLimpio = sanitizeJson(resultado)
+      const { error: errRes } = await supabase
+        .from('resultado_resumen')
+        .insert([{ 
+          ejecucion_id: ejec.id, 
+          valor_json: valorLimpio,
+          referencia: 'Cálculo en vivo'
+        }])
+      if (errRes) throw new Error(`Resultado: ${errRes.message}`)
+
       setGuardado(true)
-    } catch (e) { alert(e.message) }
+    } catch (e) { 
+      console.error(e)
+      setError(`Error al guardar: ${e.message}`)
+      alert(`Error al guardar: ${e.message}`)
+    } finally {
+      setLoadingSave(false)
+    }
   }
 
   const tabStyle = (tabName) => ({
@@ -164,10 +263,10 @@ export default function Oscilaciones() {
           <div className="form-group"><label>Paso (h) [s]:</label><input type="number" name="h" value={params.h} onChange={handleInputChange} step="0.01" /></div>
           
           <div className="button-group">
-            <button onClick={calcular} className="btn-primary">Simular Oscilación</button>
+            <button onClick={() => calcular()} className="btn-primary">Simular Oscilación</button>
             {resultado && (
-              <button onClick={guardar} className="btn-secondary">
-                {guardado ? '✅ Guardado' : 'Guardar en Historial'}
+              <button onClick={guardar} disabled={loadingSave} className="btn-secondary">
+                {loadingSave ? 'Guardando...' : guardado ? '✅ Guardado' : 'Guardar en Historial'}
               </button>
             )}
           </div>
